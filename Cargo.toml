@@ -1,0 +1,14 @@
+[package]
+name = "hyper_tls_repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "0.14", features = ["full"] }
+tokio-rustls = "0.23"
+rustls = "0.21"
+uuid = "1.2"
+parking_lot = "0.12"
+prometheus = "0.13.4"
+rustls-pemfile = "2.2.0"
