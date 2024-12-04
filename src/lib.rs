@@ -19,7 +19,10 @@ use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::LazyConfigAcceptor;
 
-#[derive(Copy, Clone)]
+use tracing::info;
+use tracing_subscriber;
+
+#[derive(Debug, Copy, Clone)]
 enum TlsConfig {
     Disabled,
     Enabled,
@@ -37,13 +40,13 @@ async fn run_server(
     let (shut_down_connections_tx, shut_down_connections_rx) = watch::channel::<()>(());
 
     loop {
-        tokio::select! {
-            _ = &mut shutdown_receiver => {
-                drop(shut_down_connections_rx);
+        tokio::select! { // wait for Incoming connections
+            _ = &mut shutdown_receiver => { // Shutdown signal
+                drop(shut_down_connections_rx); //  cleans up resources
                 break;
             }
-            conn = tcp_listener.accept() => {
-                tokio::spawn(
+            conn = tcp_listener.accept() => { // The server listens for incoming TCP connections using the TcpListener.
+                tokio::spawn( // Each connection is handled in a separate task (tokio::spawn) by calling handle_tcp_conn.
                     handle_tcp_conn(
                         conn,
                         wait_for_request_to_complete_rx.clone(),
@@ -225,16 +228,44 @@ mod tests {
     use hyper::StatusCode;
     use tokio::sync::mpsc;
 
+    use tracing::info;
+    use tracing_subscriber;
+
+    /// Initializes logging for the library.
+    /// This should be called by the consuming application.
+    // pub fn initialize_logging() {
+    //     tracing_subscriber::fmt()
+    //         .with_max_level(tracing::Level::DEBUG)
+    //         .init();
+    //     tracing::info!("Logging initialized for the library.");
+    // }
+    use std::sync::Once;
+    // use tracing_subscriber;
+
+    static INIT: Once = Once::new();
+
+    fn initialize_logging() {
+        INIT.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .init();
+        });
+    }
+
     /// This always passes.
     #[tokio::test]
     async fn graceful_shutdown_without_tls() {
-        test_graceful_shutdown(TlsConfig::Disabled).await
+        initialize_logging();
+        // test_graceful_shutdown(TlsConfig::Disabled).await
+        test_graceful_shutdown_w_debug_logs(TlsConfig::Disabled).await
     }
 
     /// This always fails.
     #[tokio::test]
     async fn graceful_shutdown_with_tls() {
-        test_graceful_shutdown(TlsConfig::Enabled).await
+        initialize_logging();
+        // test_graceful_shutdown(TlsConfig::Enabled).await
+        test_graceful_shutdown_w_debug_logs(TlsConfig::Enabled).await
     }
 
     /// ## Steps
@@ -255,6 +286,7 @@ mod tests {
                 .await
                 .unwrap();
             let addr = tcp_listener.local_addr().unwrap();
+            tracing::info!("Test server starting on {:?}", addr);
 
             let (shutdown_sender, shutdown_receiver) = oneshot::channel();
             let (successful_shutdown_tx, successful_shutdown_rx) = oneshot::channel();
@@ -309,10 +341,10 @@ mod tests {
                     Err(err) => {
                         panic!(
                             r#"
-Error during the request/response cycle:
-{err}
-{err:?}
-"#
+                            Error during the request/response cycle:
+                            {err}
+                            {err:?}
+                            "#
                         )
                     }
                 }
@@ -322,7 +354,110 @@ Error during the request/response cycle:
             // If it was shut down and every request succeeded then we ca be confident that the
             // graceful shutdown process worked.
             let _did_shutdown = wait_max_3_seconds(successful_shutdown_rx).await;
+            tracing::info!("Test server shut down successfully.");
         }
+    }
+
+    async fn test_graceful_shutdown_w_debug_logs(tls_config: TlsConfig) {
+        tracing::info!(
+            "Starting `test_graceful_shutdown` with TLS Config: {:?}",
+            tls_config
+        );
+
+        // const TEST_REPETITION_COUNT: usize = 100;
+        const TEST_REPETITION_COUNT: usize = 5;
+
+        for iteration in 0..TEST_REPETITION_COUNT {
+            tracing::info!("Starting test iteration {}", iteration + 1);
+
+            let tcp_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("Failed to bind TCP listener");
+            let addr = tcp_listener
+                .local_addr()
+                .expect("Failed to retrieve local address");
+
+            let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+            let (successful_shutdown_tx, successful_shutdown_rx) = oneshot::channel();
+
+            std::thread::spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        tracing::info!("Server runtime started for iteration {}", iteration + 1);
+                        run_server(tcp_listener, shutdown_receiver, tls_config).await;
+                        successful_shutdown_tx
+                            .send(())
+                            .expect("Failed to send shutdown confirmation");
+                    })
+            });
+
+            let mut request_handles = vec![];
+
+            let (response_received_tx, mut response_received_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+
+            const CONCURRENT_REQUEST_COUNT: usize = 10;
+            for i in 0..CONCURRENT_REQUEST_COUNT {
+                let response_received_tx = response_received_tx.clone();
+                let handle = tokio::spawn(async move {
+                    let result = send_get_request(addr, tls_config).await;
+                    if result.is_ok() {
+                        tracing::info!("Request {} succeeded", i + 1);
+                    } else {
+                        tracing::error!("Request {} failed: {:?}", i + 1, result);
+                    }
+                    response_received_tx.send(()).unwrap();
+                    result
+                });
+                request_handles.push(handle);
+            }
+
+            tracing::info!("Waiting for the first response...");
+            let _ = response_received_rx
+                .recv()
+                .await
+                .expect("Failed to receive response");
+            tracing::info!("First response received. Sending shutdown signal.");
+
+            shutdown_sender
+                .send(())
+                .expect("Failed to send shutdown signal");
+
+            for (i, handle) in request_handles.into_iter().enumerate() {
+                match handle.await.unwrap() {
+                    Ok(status_code) => {
+                        assert_eq!(
+                            status_code,
+                            StatusCode::OK,
+                            "Request {} returned an unexpected status code",
+                            i + 1
+                        );
+                        tracing::info!(
+                            "Request {} completed with status: {:?}",
+                            i + 1,
+                            status_code
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Error during request/response cycle for request {}: {:?}",
+                            i + 1,
+                            err
+                        );
+                        panic!("Request {} failed with error: {:?}", i + 1, err);
+                    }
+                }
+            }
+
+            let _ = wait_max_3_seconds(successful_shutdown_rx).await;
+            tracing::info!(
+                "Server shut down successfully for iteration {}",
+                iteration + 1
+            );
+        }
+
+        tracing::info!("`test_graceful_shutdown` completed successfully.");
     }
 
     async fn send_get_request(
@@ -353,3 +488,5 @@ Error during the request/response cycle:
             .unwrap();
     }
 }
+
+
