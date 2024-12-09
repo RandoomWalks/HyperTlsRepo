@@ -1,177 +1,125 @@
-### **TLS Shutdown Process**
-The shutdown process for a TLS connection is defined by the **TLS specification** and must follow three sequential steps:
+### Code Flow Explanation
 
-```
-+---------------------------+  
-| TLS Connection Active     |  
-+---------------------------+  
-            ↓              
-    Flush Pending Writes       
-            ↓              
- Send "close_notify" Alert    
-            ↓              
- Wait for Client Acknowledgment
-            ↓              
-    Close the TCP Socket       
-```
-
-#### Visualization:
-
-```
-Client                  Server
-   |                       |
-   | <--- Flush Data ------|  (1) Flush remaining write buffer
-   |                       |
-   | <--- close_notify ----|  (2) Send TLS close_notify alert
-   |                       |
-   | ---- ACK close_notify >|  (3) Client acknowledges shutdown
-   |                       |
-   |                       |  (4) Server closes TCP connection
-```
+Below is the flow of the code, broken into logical steps for both **Client** and **Server** operations, highlighting how they interact to establish a secure TLS connection.
 
 ---
 
-### **Root Causes of the Issue**
-1. **Unflushed Write Buffers:**
-   - Data in the server’s write buffer is not fully transmitted before the shutdown begins.
-   - This can happen if the shutdown process initiates before pending writes complete.
+#### **Flow Explanation:**
+1. **Connection Setup:**
+   - The client sends an HTTPS request to the server.
+   - The server’s `TcpListener` accepts the connection and wraps it in a TLS stream.
+   - The TLS handshake validates the server's certificate using the client’s root certificate store.
 
-2. **Client Misbehavior:**
-   - Some clients fail to respond to the `close_notify` alert or take too long to acknowledge it.
-   - This results in the server timing out and force-closing the connection.
+2. **Secure Communication:**
+   - Once the TLS handshake succeeds, the server processes the request via the `echo` function.
+   - The client receives a response from the server and validates its content.
 
-3. **Race Conditions:**
-   - Shutdown is triggered before all write operations finish.
-   - TCP socket closure can race with TLS shutdown, causing errors.
+#### **Server Side:**
+- **Input:**
+  - Certificate and private key files.
+  - Incoming TCP connections.
+- **Output:**
+  - Secure TLS streams for communication.
 
-4. **Network Issues:**
-   - Delayed or dropped packets in the network can cause the client or server to misinterpret the shutdown sequence.
+#### **Client Side:**
+- **Input:**
+  - Root certificate files.
+  - HTTPS URIs for the server.
+- **Output:**
+  - Verified server responses.
 
----
-
-### **Illustrating the Problem with an Example**
-Let’s simulate a problematic scenario:
-
-#### Working Case:
-```
-Step 1: Write buffer flushed successfully.
-Server: "Sending last piece of data..."   --> Data fully sent to client.
-Client: "Data received!"
-
-Step 2: TLS close_notify sent successfully.
-Server: "Sending TLS close_notify..."    --> close_notify alert reaches client.
-Client: "Acknowledging close_notify."
-
-Step 3: Socket closed successfully.
-Server: "Closing TCP socket."
-```
-
-#### Problematic Case:
-```
-Step 1: Unflushed write buffer.
-Server: "Sending last piece of data..."  --> Data partially sent, socket closed early.
-Client: "Incomplete data received!"
-
-Step 2: close_notify not acknowledged.
-Server: "Sending TLS close_notify..."    --> close_notify dropped or delayed.
-Client: [No response]
-
-Step 3: Force-close after timeout.
-Server: "Timeout waiting for acknowledgment. Forcing shutdown..."
-```
 
 ---
 
-### **Key Challenges**
 
-1. **Ensuring Pending Writes are Flushed:**
-   - Data must be sent completely before the `close_notify` is dispatched.
-   - Skipping this step risks incomplete data transmission.
+### **1. Server Flow**
+The server initializes its configuration, listens for connections, and handles each connection securely using Rustls.
 
-2. **Handling Misbehaving Clients:**
-   - Some clients don’t send the expected acknowledgment, causing the server to wait indefinitely.
+#### **Steps:**
+1. **Load Certificates and Private Key:**
+   - The server loads its `.pem` (certificate) and `.rsa` (private key) files using `load_certs` and `load_private_key`.
 
-3. **Timeouts and Edge Cases:**
-   - A well-defined timeout is required to prevent the server from hanging forever while waiting for acknowledgment.
+2. **Create ServerConfig:**
+   - A `rustls::ServerConfig` object is built with the loaded certificate and private key.
+   - It specifies whether client authentication is required (`with_no_client_auth` disables it).
 
-4. **Concurrency Issues:**
-   - In high-traffic environments, multiple simultaneous shutdowns can increase the risk of race conditions.
+3. **Wrap TCP Listener with TLS Acceptor:**
+   - A `tokio_rustls::TlsAcceptor` wraps the `TcpListener`, enabling it to handle secure connections.
 
----
-
-### **Proposed Solution Steps**
-
-#### 1. **Flush the Write Buffer**
-Before initiating the TLS shutdown, ensure all pending data is written to the client:
-```
-Server:
-    "Flushing write buffer..."
-    IF successful: proceed to next step.
-    ELSE: Log error and force shutdown.
-```
-
-#### 2. **Send `close_notify`**
-Send the `close_notify` TLS alert to inform the client that the connection is closing:
-```
-Server:
-    "Sending TLS close_notify alert..."
-    Log the timestamp and proceed.
-```
-
-#### 3. **Wait for Client Acknowledgment**
-Wait for the client to acknowledge the `close_notify`. Set a timeout to prevent indefinite waits:
-```
-Server:
-    "Waiting for close_notify acknowledgment..."
-    IF acknowledgment received: close socket.
-    ELSE: Log timeout and force shutdown.
-```
-
-#### 4. **Close the Socket**
-Close the underlying TCP socket to release resources:
-```
-Server:
-    "Closing TCP socket."
-    Log the result.
-```
+4. **Handle Connections:**
+   - The server listens for incoming connections (`listener.accept()`).
+   - Each accepted connection is wrapped in a TLS stream (`TlsAcceptor::accept`).
+   - The TLS stream is passed to Hyper’s connection handler (`serve_connection`), which routes requests to the `echo` service function.
 
 ---
 
-### **How the Solution Prevents the Issue**
+### **2. Client Flow**
+The client initializes its configuration, establishes a secure connection to the server, and sends an HTTPS request.
 
-1. **Preventing Unflushed Buffers:**
-   - Ensuring data is flushed before the shutdown starts guarantees complete delivery.
+#### **Steps:**
+1. **Load Root Certificates:**
+   - The client loads trusted root certificates using `load_certs`.
+   - These certificates are added to a `rustls::RootCertStore` to verify the server’s certificate.
 
-2. **Handling Client Misbehavior:**
-   - A timeout ensures the server doesn’t hang indefinitely for a misbehaving client.
+2. **Build ClientConfig:**
+   - A `rustls::ClientConfig` is created with the root certificate store.
+   - It specifies that no client-side authentication is required (`with_no_client_auth`).
 
-3. **Mitigating Race Conditions:**
-   - Sequential steps (flush → notify → close) ensure no operations overlap.
+3. **Create HTTPS Connector:**
+   - The `hyper_rustls::HttpsConnector` is built using the client configuration.
+   - It integrates HTTPS support into the Hyper client.
 
-4. **Diagnosing Failures:**
-   - Detailed logging and metrics for each stage help debug issues.
+4. **Make HTTPS Request:**
+   - The client sends a secure HTTP request to the server (`client.get(uri)`).
+   - The server’s response is validated (e.g., checking the status code is `200`).
 
 ---
 
-### **Final Visualization**
+### **3. Interaction Flow**
 
-Here’s the solution in action, showing successful and problematic scenarios side-by-side:
+#### **Diagram:**
+```mermaid
+flowchart TB
+    subgraph Client ["Client Side"]
+        RC[Root Certificate Store]
+        CC[Client Config]
+        HC[HTTPS Connector]
+        HClient[Hyper Client]
+        
+        RC -->|add_parsable_certificates| CC
+        CC -->|build| HC
+        HC -->|HTTPS support| HClient
+    end
 
-#### Successful Shutdown:
-```
-Client                     Server
-   | <---- Data Flush -----|    (Flush write buffer)
-   | <--- close_notify ----|    (Send TLS close_notify)
-   | ---- ACK close_notify >|    (Wait for acknowledgment)
-   |                       |
-   |                       |    (Close TCP socket)
+    subgraph Server ["Server Side"]
+        Cert[(Certificates)]
+        PKey[(Private Key)]
+        SC[Server Config]
+        TA[TLS Acceptor]
+        
+        Cert --> SC
+        PKey --> SC
+        SC -->|Arc::new| TA
+    end
+
+    subgraph Connection ["Connection Flow"]
+        L[TCP Listener]
+        SS[Server Stream]
+        TS[TLS Stream]
+        SF[Service Function]
+        
+        L -->|accept| SS
+        SS -->|TLS accept| TS
+        TS -->|serve_connection| SF
+    end
+
+    Client -->|HTTPS Request| Connection
+    Server -->|Handle Connection| Connection
+
+style Client fill:#e1f3d8
+style Server fill:#ffd7d7
+style Connection fill:#dae8fc
 ```
 
-#### Problematic Shutdown:
-```
-Client                     Server
-   | <---- Partial Flush --|    (Flush interrupted or incomplete)
-   | <--- close_notify ----|    (Send TLS close_notify)
-   | [No ACK received]     |    (Wait times out)
-   |                       |    (Force-close TCP socket)
-```
+
+---
